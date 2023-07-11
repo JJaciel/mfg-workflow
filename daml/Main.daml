@@ -39,6 +39,7 @@ template RequirementAssignment
         signatory requirement.planner
         observer requirement.productionManager
 
+        -- | can only be exercised by the assigned ProductionManager in the Requirement
         choice AcceptRequirement: ContractId Requirement
             controller requirement.productionManager
             do create requirement
@@ -48,6 +49,7 @@ data RequirementInfo = RequirementInfo with
     product: Text
     quantity: Int
         deriving (Show, Eq)
+
 
 -- | Result contract
 template Requirement
@@ -64,6 +66,7 @@ template Requirement
         key (productionManager, requirementInfo.id) : (Party, Text)
         maintainer key._1
 
+        -- | manager creates ProductLot and set himself as responsible, so it could exercise archiving choices on it
         nonconsuming choice SetupProductLot: ContractId ProductLot
             controller productionManager
                 do
@@ -152,8 +155,9 @@ template ProductLot
                     create this with
                         processWorkflow = sortOn (\x -> x.order) (newProcess :: processWorkflow)
 
+        -- | Re-creates ProductLot now with operator as responsible so it can exercise archiving actions from it
         choice AssignNextProcess: ContractId ProcessReview
-            controller lotResponsible
+            controller lotManager
                 do
                     assertMsg "There're no processes in the map" (not (null processWorkflow))
                     let
@@ -173,6 +177,7 @@ template ProductLot
                             lotResponsible = (fromSome nextProcess).operator
                             ..
 
+        -- | this choice can be exercised from the Process and re-assigns the manager as the lotResponsible
         choice CreateRevision: ContractId ProcessReview
             with
                 process: Process
@@ -193,6 +198,7 @@ template ProductLot
                 exerciseByKey @Requirement (lotManager, requirementInfo.id) Fulfill
                     with totalHours
 
+-- | Proposal contract -> works to transfer the ProductLot from manager to operator and viceversa 
 template ProcessReview
     with
         process: Process
@@ -284,6 +290,7 @@ template Process
                 create this with
                     workedHours = hours :: workedHours 
 
+        -- | this choice exercises CreateRevision in ProductLot to create a new ProcessReview contract with productLot data and process data
         choice RequestRevision: ContractId ProcessReview
             controller operator
             do
