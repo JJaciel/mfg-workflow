@@ -1,0 +1,292 @@
+module Main where
+
+import DA.List ((\\), head, sortOn)
+import DA.Foldable (Foldable(maximum))
+import DA.Optional (fromSome, isSome)
+
+-- | Service contract
+template MRPService
+    with
+        planner: Party
+    where
+        signatory planner
+
+        nonconsuming choice AssignRequirement: ContractId RequirementAssignment
+            with 
+                productionManager: Party
+                requirement: RequirementInfo
+            controller planner
+                do 
+                    assertMsg "Cannot create a requirement without a proper Id" (requirement.id /= "")
+                    assertMsg "Cannot create a requirement for a prouct not defined" (requirement.product /= "")
+                    assertMsg "Cannot create a requirement for a 0 proucts" (requirement.quantity /= 0)
+                    create RequirementAssignment
+                        with 
+                            requirement = Requirement
+                                with
+                                    planner
+                                    productionManager
+                                    requirementInfo = requirement
+                                    isFulfilled = False
+                                    investedHours = 0
+
+
+-- | Proposal contract
+template RequirementAssignment
+    with
+        requirement: Requirement
+    where
+        signatory requirement.planner
+        observer requirement.productionManager
+
+        choice AcceptRequirement: ContractId Requirement
+            controller requirement.productionManager
+            do create requirement
+
+data RequirementInfo = RequirementInfo with
+    id: Text
+    product: Text
+    quantity: Int
+        deriving (Show, Eq)
+
+-- | Result contract
+template Requirement
+    with
+        planner: Party
+        productionManager: Party
+
+        requirementInfo: RequirementInfo
+        isFulfilled: Bool
+        investedHours: Int
+    where
+        signatory planner, productionManager
+
+        key (productionManager, requirementInfo.id) : (Party, Text)
+        maintainer key._1
+
+        nonconsuming choice SetupProductLot: ContractId ProductLot
+            controller productionManager
+                do
+                    create ProductLot
+                        with
+                            lotManager = productionManager
+                            lotResponsible = productionManager
+                            requirementInfo
+                            processWorkflow = [] 
+                            performedProcesses = [] 
+        
+        choice Fulfill: ContractId Requirement
+            with totalHours: Int
+            controller productionManager
+            do
+                create this with
+                    isFulfilled = True
+                    investedHours = totalHours
+
+data ProcessWorkflowItem = ProcessWorkflowItem with
+    operator: Party
+    name: Text
+    order: Int
+    isReprocess: Bool
+    reprocessFeedback: Text
+        deriving (Show, Eq)
+
+getNextProcess: [ProcessWorkflowItem] -> [ProcessWorkflowItem] -> Optional ProcessWorkflowItem
+getNextProcess workflow performed = 
+    do
+        let
+            toPerform = sortOn (\x -> x.order) (workflow \\ performed)
+        if (null toPerform) then None
+        else Some (head toPerform)
+
+data ProcessResult = ProcessResult with
+    processItem: ProcessWorkflowItem
+    hours: [Int]
+    status: Text
+        deriving (Show, Eq)
+
+class Processed i o where
+    getTotalHours: i -> o
+
+instance Processed ProcessResult Int where
+    getTotalHours p = sum p.hours
+
+
+-- | Result contract
+template ProductLot
+    with
+        lotManager: Party
+        lotResponsible: Party
+
+        requirementInfo: RequirementInfo
+        processWorkflow: [ProcessWorkflowItem]
+        performedProcesses: [ProcessResult]
+    where
+        signatory lotManager, lotResponsible
+        observer lotManager
+
+        key (lotResponsible, requirementInfo.id) : (Party, Text)
+        maintainer key._1
+
+        choice AddProcessToWorkflow: ContractId ProductLot
+            with
+                operator: Party
+                name: Text
+            controller lotManager
+                do
+                    let 
+                        indexes = map (\p -> p.order) processWorkflow
+                        nextIndex = do
+                            if (not (null indexes)) 
+                                then (maximum indexes) + 1
+                                else 0
+                        newProcess = ProcessWorkflowItem with
+                            operator
+                            name
+                            order = nextIndex
+                            isReprocess = False
+                            reprocessFeedback = ""
+                    assertMsg "Cannot create a process without a name" (name /= "")
+                    assertMsg "Process already on workflow" (name `notElem` (map (\x -> x.name) processWorkflow))
+                    assertMsg "Processing already started" (null performedProcesses)
+                    create this with
+                        processWorkflow = sortOn (\x -> x.order) (newProcess :: processWorkflow)
+
+        choice AssignNextProcess: ContractId ProcessReview
+            controller lotResponsible
+                do
+                    assertMsg "There're no processes in the map" (not (null processWorkflow))
+                    let
+                        nextProcess = getNextProcess processWorkflow (map (.processItem) performedProcesses)
+                    assertMsg "There are no more processes to perform" (isSome nextProcess)
+                    create ProcessReview with
+                        process = Process with
+                            supervisor = lotManager
+                            operator = (fromSome nextProcess).operator
+                            name = (fromSome nextProcess).name
+                            order = (fromSome nextProcess).order
+                            reqInfo = requirementInfo
+                            workedHours = []
+                            isReprocess = (fromSome nextProcess).isReprocess
+                            reprocessFeedback = (fromSome nextProcess).reprocessFeedback
+                        productLot = ProductLot with
+                            lotResponsible = (fromSome nextProcess).operator
+                            ..
+
+        choice CreateRevision: ContractId ProcessReview
+            with
+                process: Process
+            controller process.operator
+                do
+                    assertMsg "Cannot request a revision without hours worked" ((sum process.workedHours) > 0)
+                    create ProcessReview with
+                        process
+                        productLot = ProductLot with
+                            lotResponsible = lotManager
+                            ..
+
+        choice FulfillRequirement: ContractId Requirement
+            controller lotManager
+            do
+                assertMsg "Cannot fulfill a requirement without performed processes" (not (null performedProcesses))
+                let totalHours = foldl (\acc p -> acc + (getTotalHours p)) 0 performedProcesses
+                exerciseByKey @Requirement (lotManager, requirementInfo.id) Fulfill
+                    with totalHours
+
+template ProcessReview
+    with
+        process: Process
+        productLot: ProductLot
+    where
+        signatory process.supervisor
+        observer process.operator
+
+        choice AcceptAssignment: ContractId Process
+            controller process.operator
+            do
+                create productLot
+                create process
+
+        choice SetProcessAsConformant: ContractId ProductLot
+            controller process.supervisor
+            do
+                let
+                    processResult = ProcessResult with
+                        processItem = ProcessWorkflowItem with
+                            operator = process.operator
+                            name = process.name
+                            order = process.order
+                            isReprocess = process.isReprocess
+                            reprocessFeedback = process.reprocessFeedback
+                        hours = process.workedHours
+                        status = "CONFORMANT"
+                create productLot with
+                    performedProcesses = sortOn (\x -> x.processItem.order) (processResult :: productLot.performedProcesses)
+
+        choice SetProcessAsNonConformant: ContractId ProductLot
+            with feedback: Text
+            controller process.supervisor
+            do
+                assertMsg "Cannot reject a process without feedback" (feedback /= "")
+                let 
+                    processResult = ProcessResult with
+                        processItem = ProcessWorkflowItem with
+                            operator = process.operator
+                            name = process.name
+                            order = process.order
+                            isReprocess = process.isReprocess
+                            reprocessFeedback = process.reprocessFeedback
+                        hours = process.workedHours
+                        status = "NON_CONFORMANT"
+                    reprocessItem = processResult.processItem with
+                        order = process.order + 1
+                        isReprocess = True
+                        reprocessFeedback = feedback
+                    currentWorkflow = productLot.processWorkflow
+                    updatedWorkflow = (map (\p -> 
+                                            if (p.order > process.order) 
+                                                then 
+                                                    ProcessWorkflowItem with
+                                                        operator = p.operator
+                                                        name = p.name
+                                                        order = p.order + 1
+                                                        isReprocess = False
+                                                        reprocessFeedback = ""
+                                                else p
+                                        ) currentWorkflow)
+                    workflow = sortOn (\x -> x.order) (reprocessItem :: updatedWorkflow)
+                create ProductLot with
+                    lotManager = productLot.lotManager
+                    lotResponsible = productLot.lotResponsible
+                    requirementInfo = productLot.requirementInfo
+                    processWorkflow = workflow
+                    performedProcesses = sortOn (\x -> x.processItem.order) (processResult :: productLot.performedProcesses)
+
+        
+-- | Result contract
+template Process
+    with
+        supervisor: Party
+        operator: Party
+        name: Text
+        order: Int
+        reqInfo: RequirementInfo
+        workedHours: [Int]
+        isReprocess: Bool
+        reprocessFeedback: Text
+    where
+        signatory supervisor, operator
+
+        choice AddWorkedHours: ContractId Process
+            with hours: Int
+            controller operator
+            do
+                create this with
+                    workedHours = hours :: workedHours 
+
+        choice RequestRevision: ContractId ProcessReview
+            controller operator
+            do
+                exerciseByKey @ProductLot (operator, reqInfo.id) CreateRevision
+                    with 
+                        process = this
