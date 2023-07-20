@@ -67,3 +67,6 @@ To test, in a new terminal run:
 ```sh
 daml test
 ```
+
+## Evaluation results
+![capstone results](./capstone-results.png "Results")
